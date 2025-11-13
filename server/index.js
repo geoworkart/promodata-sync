@@ -8,20 +8,26 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json());
 
-// In-memory store for jobs and settings. In a production app, use a database.
+// In-memory store. In a production app, use a database.
 let jobs = {};
 let jobCounter = 1;
 const createJobId = () => `JOB-${String(jobCounter++).padStart(5, '0')}`;
+
+// Default settings, can be overwritten by POST /api/settings
 let settings = {
     rules: { defaultMargin: 30, conditionalRules: [] },
     mappings: { categories: [], fields: [] },
     notifications: { email: '', onSuccess: false, onFailure: true },
     advanced: { requestsPerMinute: 60 }
 };
+// In-memory sets for ignored items
+let ignoredSupplierIds = new Set();
+let ignoredCategoryIds = new Set();
+
 
 // --- API Endpoints ---
 
-// Add a root endpoint for health checks and deployment verification
+// Health check
 app.get('/', (req, res) => {
     res.status(200).send('Promodata Sync Backend is running.');
 });
@@ -30,51 +36,84 @@ app.get('/', (req, res) => {
 app.get('/api/settings', (req, res) => {
     res.status(200).json(settings);
 });
-
 app.post('/api/settings', (req, res) => {
     console.log('[Backend] Received settings update:', req.body);
     settings = { ...settings, ...req.body };
     res.status(200).json(settings);
 });
 
+// Ignored Suppliers
+app.get('/api/ignored-suppliers', (req, res) => {
+    res.status(200).json({ supplier_ids: Array.from(ignoredSupplierIds) });
+});
+app.post('/api/ignored-suppliers', (req, res) => {
+    const { supplier_ids } = req.body;
+    if (Array.isArray(supplier_ids)) {
+        supplier_ids.forEach(id => ignoredSupplierIds.add(id));
+        res.status(200).json({ success: true, count: ignoredSupplierIds.size });
+    } else {
+        res.status(400).json({ error: 'supplier_ids must be an array.' });
+    }
+});
+app.delete('/api/ignored-suppliers', (req, res) => {
+    const { supplier_ids } = req.body;
+     if (Array.isArray(supplier_ids)) {
+        supplier_ids.forEach(id => ignoredSupplierIds.delete(id));
+        res.status(200).json({ success: true, count: ignoredSupplierIds.size });
+    } else {
+        res.status(400).json({ error: 'supplier_ids must be an array.' });
+    }
+});
 
-// 1. Test WooCommerce Connection
+
+// Ignored Categories
+app.get('/api/ignored-categories', (req, res) => {
+    res.status(200).json({ category_ids: Array.from(ignoredCategoryIds) });
+});
+app.post('/api/ignored-categories', (req, res) => {
+    const { category_ids } = req.body;
+    if (Array.isArray(category_ids)) {
+        category_ids.forEach(id => ignoredCategoryIds.add(id));
+        res.status(200).json({ success: true, count: ignoredCategoryIds.size });
+    } else {
+        res.status(400).json({ error: 'category_ids must be an array.' });
+    }
+});
+app.delete('/api/ignored-categories', (req, res) => {
+    const { category_ids } = req.body;
+     if (Array.isArray(category_ids)) {
+        category_ids.forEach(id => ignoredCategoryIds.delete(id));
+        res.status(200).json({ success: true, count: ignoredCategoryIds.size });
+    } else {
+        res.status(400).json({ error: 'category_ids must be an array.' });
+    }
+});
+
+
+// WooCommerce Test Connection
 app.post('/api/woo/test', async (req, res) => {
     const { url, key, secret } = req.body;
-    console.log('[Backend] Received test connection request for:', url);
-
-    if (!url || !key || !secret) {
-        return res.status(400).json({ error: 'Missing WooCommerce credentials.' });
-    }
+    if (!url || !key || !secret) return res.status(400).json({ error: 'Missing WooCommerce credentials.' });
 
     try {
         const wooApi = new WooCommerceRestApi({ url, consumerKey: key, consumerSecret: secret, version: 'wc/v3' });
         const response = await wooApi.get("products", { per_page: 1 });
-        
-        if (response.status !== 200) {
-            throw new Error(`WooCommerce API returned status ${response.status}`);
-        }
-
-        console.log('[Backend] WooCommerce connection test successful!');
+        if (response.status !== 200) throw new Error(`WooCommerce API returned status ${response.status}`);
         res.status(200).json({ success: true });
-
     } catch (error) {
         const errorMessage = error.response ? (error.response.data.message || JSON.stringify(error.response.data)) : error.message;
-        console.error('[Backend] Connection test failed:', errorMessage);
         res.status(500).json({ error: `Could not connect. WooCommerce said: ${errorMessage}` });
     }
 });
 
-// 2. Start a Sync Job (Now stateless)
+// Start a Sync Job (Now fully stateless)
 app.post('/api/woo/start-sync', (req, res) => {
-    const { kind, productCodes, apiConfig, wooConfig } = req.body;
+    const { kind, productCodes, apiConfig, wooConfig, settings: jobSettings } = req.body;
     const total = productCodes?.length || 0;
-    console.log(`[Backend] Received request to start sync job: ${kind} for ${total} items.`);
-
-    if (!apiConfig || !wooConfig) {
-        return res.status(400).json({ error: "API and WooCommerce configurations are required to start a sync." });
-    }
     
+    if (!apiConfig || !wooConfig || !jobSettings) {
+        return res.status(400).json({ error: "API, WooCommerce, and Settings configurations are required to start a sync." });
+    }
     if (total === 0) {
         return res.status(400).json({ error: "No products selected for sync." });
     }
@@ -89,13 +128,12 @@ app.post('/api/woo/start-sync', (req, res) => {
         error: null,
         logs: [],
         productCodes,
-        apiConfig, // Store config with the job
-        wooConfig, // Store config with the job
+        apiConfig,
+        wooConfig,
+        settings: jobSettings, // Store settings with the job
     };
-
     jobs[newJob.id] = newJob;
 
-    // Start the job asynchronously
     setTimeout(() => {
         if (jobs[newJob.id]) {
             jobs[newJob.id].status = 'running';
@@ -103,34 +141,21 @@ app.post('/api/woo/start-sync', (req, res) => {
         }
     }, 1000);
     
-    // Respond immediately with the job object, but without sensitive configs
-    const { apiConfig: ac, wooConfig: wc, ...jobForResponse } = newJob;
+    const { apiConfig: ac, wooConfig: wc, settings: s, ...jobForResponse } = newJob;
     res.status(201).json(jobForResponse);
 });
 
 
-// 3. Get Job Status
+// Job Status & Logs
 app.get('/api/jobs/:id', (req, res) => {
-    const { id } = req.params;
-    const job = jobs[id];
-
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found.' });
-    }
-    // Return job without the logs or product codes or configs
-    const { logs, productCodes, apiConfig, wooConfig, ...jobWithoutDetails } = job;
+    const job = jobs[req.params.id];
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+    const { logs, productCodes, apiConfig, wooConfig, settings, ...jobWithoutDetails } = job;
     res.status(200).json(jobWithoutDetails);
 });
-
-// 4. Get Detailed Job Logs
 app.get('/api/jobs/:id/logs', (req, res) => {
-    const { id } = req.params;
-    const job = jobs[id];
-
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found.' });
-    }
-
+    const job = jobs[req.params.id];
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
     res.status(200).json(job.logs);
 });
 
@@ -139,18 +164,12 @@ const checkCondition = (productValue, operator, ruleValue) => {
     if (!productValue || !ruleValue) return false;
     const prodVal = productValue.toLowerCase();
     const ruleVal = ruleValue.toLowerCase();
-
     switch (operator) {
-        case 'is':
-            return prodVal === ruleVal;
-        case 'is_not':
-            return prodVal !== ruleVal;
-        case 'contains':
-            return prodVal.includes(ruleVal);
-        case 'does_not_contain':
-            return !prodVal.includes(ruleVal);
-        default:
-            return false;
+        case 'is': return prodVal === ruleVal;
+        case 'is_not': return prodVal !== ruleVal;
+        case 'contains': return prodVal.includes(ruleVal);
+        case 'does_not_contain': return !prodVal.includes(ruleVal);
+        default: return false;
     }
 };
 
@@ -158,7 +177,7 @@ const getApplicableMargin = (product, rules) => {
     for (const rule of rules.conditionalRules) {
         const productValue = rule.conditionField === 'category'
             ? product.categorisation?.supplier_category
-            : product.supplier?.supplier;
+            : (product.supplier?.supplier || product.supplier_name); // Add supplier_name as fallback
         if (checkCondition(productValue, rule.conditionOperator, rule.conditionValue)) {
             return rule.margin;
         }
@@ -166,32 +185,20 @@ const getApplicableMargin = (product, rules) => {
     return rules.defaultMargin;
 };
 
-
 // --- REAL SYNC LOGIC ---
-
-// Helper to fetch from Promodata API
 async function getPromodataProduct(code, apiConfig) {
     if (!apiConfig) throw new Error("Promodata API config not set for job.");
-    
     const { url, token } = apiConfig;
-    const path = `/products?code=${code}`;
-    const headers = { 'x-auth-token': token };
-
-    const response = await fetch(`${url}${path}`, { headers });
+    const response = await fetch(`${url}/products?code=${code}`, { headers: { 'x-auth-token': token } });
     if (!response.ok) throw new Error(`Promodata API returned status ${response.status}`);
-    
     const data = await response.json();
-    if (data.items && data.items.length > 0) {
-        return data.items[0];
-    }
+    if (data.items && data.items.length > 0) return data.items[0];
     throw new Error(`Product with code ${code} not found in Promodata.`);
 }
 
-// Helper to transform Promodata product to WooCommerce product
-function transformProductForWoo(product) {
+function transformProductForWoo(product, jobSettings) {
     const hasVariants = product.variants && product.variants.length > 1;
 
-    // Common data for both simple and variable products
     const commonData = {
         name: product.name,
         sku: product.code,
@@ -202,50 +209,29 @@ function transformProductForWoo(product) {
     };
 
     if (!hasVariants) {
-        // --- SIMPLE PRODUCT ---
         const firstPriceBreak = product.prices?.price_groups?.[0]?.base_price?.breaks?.[0];
         const basePrice = firstPriceBreak ? firstPriceBreak.price : 0;
-        const margin = getApplicableMargin(product, settings.rules);
+        const margin = getApplicableMargin(product, jobSettings.rules);
         const salePrice = basePrice * (1 + (margin / 100));
-
-        const simpleProductData = {
-            ...commonData,
-            type: 'simple',
-            regular_price: String(salePrice.toFixed(2)),
-        };
-        return { productData: simpleProductData, variationsData: [] };
+        return { productData: { ...commonData, type: 'simple', regular_price: String(salePrice.toFixed(2)) }, variationsData: [] };
     } else {
-        // --- VARIABLE PRODUCT ---
         const attributesMap = new Map();
         product.variants.forEach(variant => {
             Object.entries(variant.attrs).forEach(([name, value]) => {
-                if (!attributesMap.has(name)) {
-                    attributesMap.set(name, new Set());
-                }
+                if (!attributesMap.has(name)) attributesMap.set(name, new Set());
                 attributesMap.get(name).add(value);
             });
         });
 
         const wooAttributes = Array.from(attributesMap.entries()).map(([name, optionsSet], index) => ({
-            name,
-            position: index,
-            visible: true,
-            variation: true,
-            options: Array.from(optionsSet)
+            name, position: index, visible: true, variation: true, options: Array.from(optionsSet)
         }));
 
-        const variableProductData = {
-            ...commonData,
-            type: 'variable',
-            attributes: wooAttributes,
-        };
-
         const variationsData = product.variants.map(variant => {
-             const firstPriceBreak = variant.prices?.price_groups?.[0]?.base_price?.breaks?.[0];
-             const basePrice = firstPriceBreak ? firstPriceBreak.price : 0;
-             const margin = getApplicableMargin(product, settings.rules);
-             const salePrice = basePrice * (1 + (margin / 100));
-
+            const firstPriceBreak = variant.prices?.price_groups?.[0]?.base_price?.breaks?.[0];
+            const basePrice = firstPriceBreak ? firstPriceBreak.price : 0;
+            const margin = getApplicableMargin(product, jobSettings.rules);
+            const salePrice = basePrice * (1 + (margin / 100));
             return {
                 sku: variant.sku,
                 regular_price: String(salePrice.toFixed(2)),
@@ -253,42 +239,37 @@ function transformProductForWoo(product) {
             };
         });
 
-        return { productData: variableProductData, variationsData };
+        return { productData: { ...commonData, type: 'variable', attributes: wooAttributes }, variationsData };
     }
 }
-
 
 async function runRealSyncJob(jobId) {
     const job = jobs[jobId];
     if (!job) return;
 
-    const { apiConfig, wooConfig } = job;
+    const { apiConfig, wooConfig, settings: jobSettings } = job;
     console.log(`[Backend] Starting real sync for Job ${jobId}`);
     const wooApi = new WooCommerceRestApi({ ...wooConfig, version: 'wc/v3' });
 
     for (const code of job.productCodes) {
         try {
             const promoProduct = await getPromodataProduct(code, apiConfig);
-            const { productData, variationsData } = transformProductForWoo(promoProduct);
+             // Enrich product with supplier name for rules engine
+            promoProduct.supplier_name = promoProduct.supplier?.supplier;
+            const { productData, variationsData } = transformProductForWoo(promoProduct, jobSettings);
             
             if (variationsData.length === 0) {
-                // Create a simple product
                 await wooApi.post("products", productData);
-                 job.logs.push({ timestamp: new Date().toISOString(), itemId: code, status: 'success', message: `Synced simple product "${productData.name}" successfully.` });
+                job.logs.push({ timestamp: new Date().toISOString(), itemId: code, status: 'success', message: `Synced simple product "${productData.name}" successfully.` });
             } else {
-                // Create a variable product and its variations
                 const { data: parentProduct } = await wooApi.post("products", productData);
-                const parentId = parentProduct.id;
-                
-                if (parentId && variationsData.length > 0) {
-                    await wooApi.post(`products/${parentId}/variations/batch`, { create: variationsData });
+                if (parentProduct.id && variationsData.length > 0) {
+                    await wooApi.post(`products/${parentProduct.id}/variations/batch`, { create: variationsData });
                 }
-                 job.logs.push({ timestamp: new Date().toISOString(), itemId: code, status: 'success', message: `Synced variable product "${productData.name}" with ${variationsData.length} variations.` });
+                job.logs.push({ timestamp: new Date().toISOString(), itemId: code, status: 'success', message: `Synced variable product "${productData.name}" with ${variationsData.length} variations.` });
             }
-
         } catch (error) {
             const errorMessage = error.response ? (error.response.data.message || JSON.stringify(error.response.data)) : error.message;
-            console.error(`[Backend] Job ${jobId} failed for product ${code}:`, errorMessage);
             job.error = "One or more items failed to sync.";
             job.logs.push({ timestamp: new Date().toISOString(), itemId: code, status: 'failed', message: `Error: ${errorMessage}` });
         }
@@ -301,11 +282,10 @@ async function runRealSyncJob(jobId) {
     console.log(`[Backend] Job ${jobId} finished with status: ${job.status}.`);
 }
 
-// Add a catch-all for 404s to provide a JSON response instead of HTML
+// Catch-all 404
 app.use((req, res, next) => {
     res.status(404).json({ error: `Not Found: Cannot ${req.method} ${req.path}` });
 });
-
 
 app.listen(PORT, () => {
     console.log(`Backend server listening on port ${PORT}`);
