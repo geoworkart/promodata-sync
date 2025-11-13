@@ -7,7 +7,6 @@
     "start": "node server/index.js"
   },
   "dependencies": {
-    "@woocommerce/woocommerce-rest-api": "^1.0.1",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   },
